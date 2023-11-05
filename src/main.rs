@@ -34,17 +34,18 @@ impl Synthesizer {
     }
 
     pub fn note_on(&mut self, key: Keycode, waveform: Waveform) {
-        if let Some(osc) = self.oscillators.get_mut(&key) {
-            // Reset the oscillator's envelope parameters if it was releasing or attack phase wasn't completed
-            osc.is_releasing = false;
-            osc.attack_phase = 0.0; // Restart the attack phase
-            osc.release_phase = 1.0; // Ensure full volume is reached during attack phase
-        } else if let Some(freq) = frequency_from_key(key) {
-            let osc = Oscillator::new(freq, waveform, self.sample_rate);
-            self.oscillators.insert(key, osc);
+        if let Some(freq) = frequency_from_key(key) {
+            // If the key is already playing, reset its phase and envelope
+            if let Some(osc) = self.oscillators.get_mut(&key) {
+                osc.restart(freq);
+            } else {
+                // Create a new oscillator for the new note if not already playing
+                let osc = Oscillator::new(freq, waveform, self.sample_rate);
+                self.oscillators.insert(key, osc);
+            }
         }
     }
-
+    
     pub fn note_off(&mut self, key: &Keycode) {
         if let Some(osc) = self.oscillators.get_mut(key) {
             osc.start_release();
@@ -93,36 +94,55 @@ impl Oscillator {
         }
     }
 
+    // This function resets the oscillator phase to ensure smooth transition between notes
+    pub fn reset_phase(&mut self) {
+        self.phase = 0.0;
+    }
+
+    // Call this when a new note is played on the same key to ensure a smooth transition
+    pub fn restart(&mut self, frequency: f32) {
+        self.set_frequency(frequency);
+        self.reset_phase(); // Reset phase to ensure there's no click
+        self.is_releasing = false; // Stop releasing because a new note is starting
+        self.attack_phase = 0.0; // Reset attack phase to start a new envelope
+    }
+
     pub fn set_frequency(&mut self, frequency: f32) {
         self.phase_increment = 2.0 * PI * frequency / self.sample_rate as f32;
     }
 
-    // Call this when a note_off event is received
     pub fn start_release(&mut self) {
-        self.is_releasing = true;
-        self.release_phase = 1.0; // Start the release phase at full volume
+        // Only start the release if the note was fully attacked, otherwise set it to the attack_phase
+        if !self.is_releasing && self.attack_phase >= 1.0 {
+            self.is_releasing = true;
+            self.release_phase = 1.0;
+        } else {
+            self.is_releasing = true;
+            self.release_phase = self.attack_phase;
+        }
     }
 
     pub fn apply_envelope(&mut self, sample: f32) -> f32 {
-        // Apply attack phase
         if self.attack_phase < 1.0 {
             self.attack_phase += self.attack_rate;
             if self.attack_phase > 1.0 {
                 self.attack_phase = 1.0;
             }
-            sample * self.attack_phase
-        } 
-        // Apply release phase if attack phase is complete
-        else if self.is_releasing {
-            self.release_phase -= self.release_rate;
-            if self.release_phase < 0.0 {
-                self.release_phase = 0.0;
-            }
-            sample * self.release_phase
-        } else {
-            sample
+            return sample * self.attack_phase
         }
+    
+        if self.is_releasing {
+            self.release_phase -= self.release_rate;
+            if self.release_phase <= 0.0 {
+                self.release_phase = 0.0;
+                return 0.0; // Oscillator is silent, should be removed.
+            }
+            return sample * self.release_phase;
+        }
+    
+        sample // If not in attack or release phase, output the sample as is.
     }
+    
 }
 
 // Iterator implementation for synthesizer
@@ -130,49 +150,56 @@ impl Iterator for Synthesizer {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Process any pending SynthCommands (e.g., NoteOn, NoteOff)
         self.process_commands();
 
-        let headroom = 0.8; // Increased headroom to a reasonable level for volume
-        let mut sample_sum = 0.0;
-        let mut active_oscillators = 0;
-        let mut finished_oscillators = Vec::new(); // Track finished oscillators
+        // Headroom is the amount by which the signal amplitude is reduced to prevent clipping
+        let headroom = 0.8; // Avoids clipping by leaving 20% headroom
+        let mut sample_sum = 0.0; // This will accumulate the samples from all oscillators
+        let mut active_oscillators = 0; // Counts how many oscillators are contributing to the current sample
 
-        for (key, osc) in self.oscillators.iter_mut() {
+        // A list to keep track of oscillators that have finished playing
+        let mut finished_oscillators = Vec::new();
+
+        for (key, osc) in &mut self.oscillators {
             let osc_sample = match osc.waveform {
                 Waveform::Sine => osc.phase.sin(),
-                // Other waveforms can be added here
+                // Additional waveforms can be implemented here
             };
 
-            let current_sample = osc.apply_envelope(osc_sample);
+            // Envelop the oscillator's sample (handle attack and release)
+            let enveloped_sample = osc.apply_envelope(osc_sample);
 
-            // If the release phase has finished, mark the oscillator for removal
-            if osc.release_phase <= 0.0 {
-                finished_oscillators.push(*key);
-                continue;
+            // Check if the oscillator's release phase has completed
+            if osc.is_releasing && osc.release_phase <= 0.0 {
+                finished_oscillators.push(*key); // Mark oscillator for removal
+            } else {
+                // Otherwise, accumulate the sample
+                sample_sum += enveloped_sample;
+                active_oscillators += 1;
             }
 
-            sample_sum += current_sample;
-            active_oscillators += 1;
-
-            // Increment the phase of the oscillator
+            // Increment the oscillator's phase, wrapping around at 2π
             osc.phase += osc.phase_increment;
             if osc.phase > 2.0 * PI {
                 osc.phase -= 2.0 * PI;
             }
         }
 
-        // Remove oscillators that have finished their release phase
+        // Remove oscillators that have completed their release phase
         for key in finished_oscillators {
             self.oscillators.remove(&key);
         }
 
-        // Normalize the sum based on the number of oscillators to prevent clipping
+        // Normalize the sample sum to prevent clipping and apply headroom
         if active_oscillators > 0 {
-            let sample = (sample_sum / active_oscillators as f32) * headroom;
+            let average_sample = sample_sum / active_oscillators as f32;
+            let normalized_sample = average_sample * headroom;
 
-            // Soft clipping
-            Some(sample.min(1.0).max(-1.0))
+            // Enforce soft clipping
+            Some(normalized_sample.clamp(-1.0, 1.0)) // Clamping the value to the range [-1.0, 1.0]
         } else {
+            // If there are no active oscillators, output silence
             Some(0.0)
         }
     }
@@ -211,7 +238,6 @@ fn main() {
 
     // Input handling thread
     thread::spawn({
-        let tx = tx.clone();
         move || {
             let device_state = DeviceState::new();
             let mut last_pressed_keys = Vec::new();
@@ -237,7 +263,7 @@ fn main() {
                 last_pressed_keys = currently_pressed_keys.to_vec();
 
                 // Polling delay
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(1));
             }
         }
     });
